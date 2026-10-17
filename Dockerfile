@@ -11,8 +11,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install
 
-# Whisper multilíngue (small) p/ reconhecer PT + VAD silero
-RUN MODEL=sherpa-onnx-whisper-small \
+# Whisper multilíngue (base) p/ reconhecer PT + VAD silero
+RUN MODEL=sherpa-onnx-whisper-base \
  && wget -q "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${MODEL}.tar.bz2" \
  && tar xjf "${MODEL}.tar.bz2" \
  && mv "${MODEL}" model \
