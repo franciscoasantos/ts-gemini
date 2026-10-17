@@ -2,10 +2,11 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import OpusScript from "opusscript";
 import type { Session } from "@google/genai";
-import { Ts3Client, buildCommand, generateIdentity, restoreIdentity } from "./tslib/index.js";
+import { Ts3Client, buildCommand, generateIdentity, restoreIdentity, type ParsedCommand } from "./tslib/index.js";
 import { Player, beep, down48to16, parseVoice, up24to48stereo } from "./audio.js";
 import { ask, openLive } from "./gemini.js";
 import { uploadAvatar } from "./filetransfer.js";
+import { playMusic, playNowKeepQueue, shouldQueue, enqueueMusic, playRadio, getQueue, removeFromQueue, skip, stop, pause, resume } from "./manager.js";
 
 // sherpa-onnx-node é CommonJS com binário nativo (só no container); carrega via require.
 const require = createRequire(import.meta.url);
@@ -70,6 +71,32 @@ async function setAvatarOnce() {
 
 client.on("error", (e: Error) => console.error("[ts]", e.message));
 client.on("ts3error", (p: Record<string, string>) => p.id !== "0" && console.error("[ts]", p.id, p.msg));
+
+// Rastreia apelido de cada cliente, pra ignorar a voz do bot de música (ele toca no canal
+// e a música chegaria como "fala", atrapalhando/gastando a detecção da wake word).
+const nameByClid = new Map<number, string>();
+const IGNORE = (env.IGNORE_SPEAKERS || env.MUSIC_BOT_NAME || "DJ Morri")
+  .toLowerCase()
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+client.on("command", (p: ParsedCommand) => {
+  if (p.name === "notifycliententerview" || p.name === "notifyclientupdated") {
+    // enterview traz clid; clientupdated (troca de apelido ao tocar) também — mantém o nome fresco
+    for (const g of p.groups ?? [p.params]) {
+      const clid = Number(g.clid);
+      if (clid && g.client_nickname !== undefined) {
+        nameByClid.set(clid, String(g.client_nickname).toLowerCase());
+      }
+    }
+  } else if (p.name === "notifyclientleftview") {
+    for (const g of p.groups ?? [p.params]) nameByClid.delete(Number(g.clid));
+  }
+});
+function isIgnored(clid: number): boolean {
+  const nick = nameByClid.get(clid) || "";
+  return !!nick && IGNORE.some((x) => nick.includes(x));
+}
 client.on("disconnected", () => {
   resetVoice(); // zera qualquer conversa travada antes de voltar
   reconnect();
@@ -170,6 +197,7 @@ let listener: number | null = null; // null = ocioso; clid de quem ativou = conv
 let pending: Int16Array[] = []; // audio captured while the Live session connects
 let silenceTimer: NodeJS.Timeout | undefined; // marca o fim de cada fala
 let convoTimer: NodeJS.Timeout | undefined; // encerra a conversa após silêncio longo
+let closeAfterTurn = false; // fecha a sessão após a fala de confirmação de um comando
 const CONVO_IDLE_MS = Number(env.CONVO_IDLE_MS || 12000); // destranca sozinho após esse silêncio
 
 function toLive(pcm: Int16Array) {
@@ -185,6 +213,15 @@ function endConversation() {
   player.clear();
   session?.close();
   if (env.BEEP !== "0") player.push(beep([{ f: 784, ms: 110 }, { f: 587, ms: 170 }])); // desce = "liberei"
+}
+
+// Encerra a conversa na hora, sem beep de saída e sem limpar a fila de áudio
+// (usado após um comando de música, pra parar de ouvir e deixar os sons tocarem).
+function endConversationQuiet() {
+  listener = null;
+  clearTimeout(silenceTimer);
+  clearTimeout(convoTimer);
+  session?.close();
 }
 
 // Zera todo o estado de voz (usado ao reconectar, pra não ficar travado).
@@ -214,8 +251,88 @@ async function startListening(clid: number) {
     try {
       session = await openLive({
         audio: (pcm) => player.push(up24to48stereo(pcm)),
-        turnComplete: () => keepAlive(), // resposta terminou → reinicia a contagem do silêncio
+        turnComplete: () => {
+          // Após um comando de música, o Gemini fala a confirmação e AÍ a sessão fecha.
+          if (closeAfterTurn) {
+            closeAfterTurn = false;
+            endConversationQuiet();
+          } else keepAlive();
+        },
         interrupted: () => player.clear(),
+        onTool: async (name, args) => {
+          const beeps = env.BEEP !== "0";
+          // "tururum" = comando reconhecido (feedback instantâneo até a voz sair)
+          if (beeps) player.push(beep([{ f: 659, ms: 80 }, { f: 784, ms: 80 }, { f: 1047, ms: 130 }]));
+          const q = String(args?.busca ?? args?.nome ?? "");
+          // Escolhe a ação e a frase. "tocar_musica" decide fila vs. agora pelo estado atual,
+          // pra confirmação por voz corresponder ao que de fato aconteceu.
+          let run: () => Promise<unknown>;
+          let frase: string;
+          if (name === "tocar_musica") {
+            if (await shouldQueue().catch(() => false)) {
+              run = () => enqueueMusic(q);
+              frase = `adicionei ${q} na fila`;
+            } else {
+              run = () => playMusic(q);
+              frase = `ok, já vou tocar ${q}`;
+            }
+          } else if (name === "remover_fila") {
+            // rápido (sem download): faz agora e confirma o resultado real
+            const title = await removeFromQueue(q).catch(() => null);
+            run = async () => {};
+            frase = title ? `removi ${title} da fila` : `não achei ${q} na fila`;
+          } else {
+            const texto = String(args?.texto || "");
+            const action: Record<string, () => Promise<unknown>> = {
+              tocar_agora: () => playNowKeepQueue(q),
+              adicionar_fila: () => enqueueMusic(q),
+              tocar_radio: () => playRadio(q),
+              pular_musica: skip,
+              parar_musica: stop,
+              pausar_musica: pause,
+              retomar_musica: resume,
+              escrever_chat: async () => texto && sendText(2, 0, texto),
+              listar_fila: async () => {
+                const { nowPlaying, upcoming } = await getQueue();
+                const LIMIT = 15;
+                let msg = nowPlaying ? `▶ Tocando: ${nowPlaying}\n` : "";
+                if (upcoming.length) {
+                  msg += "🎵 Próximas:\n" + upcoming.slice(0, LIMIT).map((t, i) => `${i + 1}. ${t}`).join("\n");
+                  if (upcoming.length > LIMIT) msg += `\n… e mais ${upcoming.length - LIMIT}`;
+                } else if (!nowPlaying) {
+                  msg = "A fila está vazia.";
+                } else {
+                  msg += "(sem próximas na fila)";
+                }
+                sendText(2, 0, msg);
+              },
+            };
+            if (!action[name]) return { erro: "função desconhecida" };
+            run = action[name];
+            frase =
+              {
+                tocar_agora: `tocando ${q} agora`,
+                adicionar_fila: `adicionei ${q} na fila`,
+                tocar_radio: `colocando a rádio ${q}`,
+                pular_musica: "pulei",
+                parar_musica: "parei",
+                pausar_musica: "pausei",
+                retomar_musica: "voltei",
+                escrever_chat: "mandei no chat",
+                listar_fila: "mandei a fila no chat",
+              }[name] ?? "feito";
+          }
+          // Ação pesada (download ~10s) em segundo plano; o Gemini confirma por voz agora e
+          // a sessão fecha logo após essa fala (closeAfterTurn), não durante o download todo.
+          run().catch((e) => {
+            console.error(`[tool] ${name} erro:`, e.message);
+            if (beeps) player.push(beep([{ f: 392, ms: 150 }, { f: 294, ms: 200 }])); // só se falhar
+          });
+          closeAfterTurn = true;
+          clearTimeout(convoTimer);
+          convoTimer = setTimeout(endConversationQuiet, 10000); // segurança, se não vier turnComplete
+          return { resultado: "ok", diga_curto: frase };
+        },
         closed: () => {
           session = null;
           listener = null;
@@ -235,6 +352,7 @@ async function startListening(clid: number) {
 client.on("voice", (data: Buffer) => {
   const v = parseVoice(data);
   if (!v || v.opus.length === 0 || (v.codec !== 4 && v.codec !== 5)) return; // 4/5 = Opus voice/music
+  if (v.clientId !== listener && isIgnored(v.clientId)) return; // ignora a voz do bot de música
   const s = speaker(v.clientId);
   let pcm: Int16Array;
   try {

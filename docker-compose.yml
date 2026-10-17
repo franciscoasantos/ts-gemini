@@ -8,3 +8,11 @@ services:
       - ./data:/app/data
       - ./keywords.txt:/app/keywords.txt:ro
       - ./avatar.png:/app/avatar.png:ro
+    networks:
+      - default
+      - ts6
+
+networks:
+  ts6:
+    external: true
+    name: teamspeak_ts6
