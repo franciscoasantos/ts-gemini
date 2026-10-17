@@ -1,0 +1,10 @@
+services:
+  gemini-bot:
+    build: .
+    container_name: gemini-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./keywords.txt:/app/keywords.txt:ro
+      - ./avatar.png:/app/avatar.png:ro

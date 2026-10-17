@@ -1,0 +1,21 @@
+{
+  "name": "ts-gemini",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx --env-file=.env src/index.ts",
+    "check": "tsx src/audio.ts && tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@google/genai": "^2.30.0",
+    "libsodium-wrappers-sumo": "^0.8.4",
+    "opusscript": "^0.1.1",
+    "sherpa-onnx-node": "^1.13.8"
+  }
+}
